@@ -76,8 +76,9 @@ git clone https://github.com/LiYH2008/astrbot_plugin_group_welcome.git
 | `_conf_schema.json` | WebUI 配置定义 |
 | `metadata.yaml` | 插件元数据 |
 | `README.md` | 使用教程 |
-| `LICENSE` | GPL-3.0 开源协议 |
+| `LICENSE` | AGPL-3.0 开源协议 |
 
 ## 开源协议
 
-本项目采用 [GNU General Public License v3.0](LICENSE)。
+本项目采用 [GNU Affero General Public License v3.0](LICENSE)。
+

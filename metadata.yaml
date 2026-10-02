@@ -1,0 +1,8 @@
+name: astrbot_plugin_group_welcome
+desc: OneBot v11 入群 @ 欢迎与新好友自动欢迎插件，支持 AstrBot WebUI 配置群号和两段文本。
+help: |-
+  在插件配置中填写启用群号、入群欢迎文本和新好友欢迎文本。
+  群号支持多个值；只有配置的群号会触发入群欢迎。
+version: 1.0.0
+author: LiYH
+repo: https://github.com/LiYH2008/astrbot_plugin_group_welcome

@@ -8,6 +8,7 @@ from __future__ import annotations
 - AstrBot 可转换为 AstrMessageEvent 的其它平台私聊事件
 """
 
+import asyncio
 import json
 import re
 import time
@@ -15,7 +16,8 @@ from collections.abc import Mapping
 from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+import astrbot.api.message_components as Comp
 from astrbot.api.star import Context, Star, register
 
 
@@ -32,6 +34,7 @@ class GroupWelcomePlugin(Star):
         super().__init__(context)
         self.config = config
         self._friend_greeted_at: dict[str, float] = {}
+        self._pending_friend_tasks: dict[str, asyncio.Task] = {}
 
     def _config_get(self, key: str, default: Any) -> Any:
         """兼容 AstrBotConfig 和普通 dict，避免旧版本启动时配置为空。"""
@@ -150,22 +153,59 @@ class GroupWelcomePlugin(Star):
             logger.warning(f"发送 OneBot 入群欢迎失败 group={group_id} user={user_id}: {exc}")
             return False
 
-    async def _send_onebot_private_welcome(
-        self, event: AstrMessageEvent, user_id: str, text: str
-    ) -> bool:
-        """通过 OneBot API 给新好友发送私聊欢迎。"""
-        if not text or not user_id or not getattr(event, "bot", None):
+    async def _send_private_welcome(self, event: AstrMessageEvent, text: str) -> bool:
+        """通过 AstrBot 当前适配器的事件会话发送私聊欢迎。"""
+        if not text:
             return False
         try:
-            await event.bot.api.call_action(
-                "send_private_msg",
-                user_id=int(user_id),
-                message=[{"type": "text", "data": {"text": text}}],
-            )
+            await event.send(MessageChain([Comp.Plain(text)]))
             return True
         except Exception as exc:
-            logger.warning(f"发送 OneBot 新好友欢迎失败 user={user_id}: {exc}")
+            logger.warning(f"发送新好友欢迎失败: {exc}")
             return False
+
+    async def _retry_private_welcome(
+        self, event: AstrMessageEvent, user_id: str, text: str
+    ) -> None:
+        """好友请求早于同意动作到达时，等待好友关系建立后重试发送。"""
+        try:
+            for delay in (0.0, 2.0, 5.0, 10.0, 20.0, 30.0):
+                if delay:
+                    await asyncio.sleep(delay)
+                if user_id in self._friend_greeted_at:
+                    return
+                if await self._send_private_welcome(event, text):
+                    self._friend_greeted_at[user_id] = time.monotonic()
+                    logger.info(f"已重试发送新好友欢迎 user={user_id}")
+                    return
+            logger.warning(f"新好友欢迎重试仍失败 user={user_id}")
+        except asyncio.CancelledError:
+            return
+        finally:
+            current = self._pending_friend_tasks.get(user_id)
+            if current is asyncio.current_task():
+                self._pending_friend_tasks.pop(user_id, None)
+
+    def _schedule_private_welcome_retry(
+        self, event: AstrMessageEvent, user_id: str, text: str
+    ) -> None:
+        if not user_id:
+            return
+        current = self._pending_friend_tasks.get(user_id)
+        if current and not current.done():
+            return
+        task = asyncio.create_task(self._retry_private_welcome(event, user_id, text))
+        self._pending_friend_tasks[user_id] = task
+
+    async def terminate(self) -> None:
+        """插件卸载时取消尚未完成的好友欢迎重试任务。"""
+        tasks = list(self._pending_friend_tasks.values())
+        self._pending_friend_tasks.clear()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def handle_notice(self, event: AstrMessageEvent):
@@ -209,6 +249,10 @@ class GroupWelcomePlugin(Star):
         if not text:
             return
 
+        # friend_add/request 事件的 message_str 为空，若不阻止默认处理，
+        # AstrBot 会继续把该空私聊事件交给 LLM，产生额外的自动打招呼。
+        event.should_call_llm(True)
+
         user_id = str(self._get(raw, "user_id", "")).strip()
         if not user_id:
             try:
@@ -217,23 +261,26 @@ class GroupWelcomePlugin(Star):
                 user_id = ""
 
         # 某些实现会连续发 request/friend 和 notice/friend_add，短时间内只欢迎一次。
+        # 只有发送成功后才记录，避免请求早于同意时把后续 friend_add 错误去重。
         now = time.monotonic()
         if user_id and now - self._friend_greeted_at.get(user_id, 0.0) < 30:
             return
-        if user_id:
-            self._friend_greeted_at[user_id] = now
 
-        if self._is_onebot_event(event, raw) and user_id:
-            if await self._send_onebot_private_welcome(event, user_id, text):
-                logger.info(f"已发送新好友欢迎 user={user_id}")
-                return
-
-        # 让 AstrBot 按当前平台的私聊会话发送，兼容非 OneBot 适配器。
-        try:
-            yield event.plain_result(text)
-            logger.info("已发送新好友欢迎消息")
-        except Exception as exc:
-            logger.warning(f"发送新好友欢迎失败: {exc}")
+        if await self._send_private_welcome(event, text):
+            if user_id:
+                self._friend_greeted_at[user_id] = now
+            logger.info(f"已发送新好友欢迎 user={user_id or 'unknown'}")
+            event.stop_event()
+        else:
+            if is_friend_request and user_id:
+                self._schedule_private_welcome_retry(event, user_id, text)
+                event.stop_event()
+                logger.warning(
+                    f"好友关系可能尚未建立，已安排延迟重试 user={user_id}"
+                )
+            else:
+                event.stop_event()
+                logger.warning("新好友欢迎消息发送失败，已阻止默认 LLM 回复")
 
 
 __all__ = ["GroupWelcomePlugin"]

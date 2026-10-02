@@ -6,3 +6,6 @@ help: |-
 version: 1.0.0
 author: LiYH
 repo: https://github.com/LiYH2008/astrbot_plugin_group_welcome
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.27.0"
